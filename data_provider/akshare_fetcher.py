@@ -1446,15 +1446,16 @@ class AkshareFetcher(BaseFetcher):
     def get_chip_distribution(self, stock_code: str) -> Optional[ChipDistribution]:
         """
         获取筹码分布数据
-        
+
         数据来源：ak.stock_cyq_em()
         包含：获利比例、平均成本、筹码集中度
-        
+
         注意：ETF/指数没有筹码分布数据，会直接返回 None
-        
+        GitHub Actions 环境下（美国服务器）重试 3 次以应对网络延迟。
+
         Args:
             stock_code: 股票代码
-            
+
         Returns:
             ChipDistribution 对象（最新一天的数据），获取失败返回 None
         """
@@ -1474,52 +1475,64 @@ class AkshareFetcher(BaseFetcher):
         if _is_etf_code(stock_code):
             logger.debug(f"[API跳过] {stock_code} 是 ETF/指数，无筹码分布数据")
             return None
-        
-        try:
-            # 防封禁策略
-            self._set_random_user_agent()
-            self._enforce_rate_limit()
-            
-            logger.info(f"[API调用] ak.stock_cyq_em(symbol={stock_code}) 获取筹码分布...")
-            import time as _time
-            api_start = _time.time()
-            
-            df = ak.stock_cyq_em(symbol=stock_code)
-            
-            api_elapsed = _time.time() - api_start
-            
-            if df.empty:
-                logger.warning(f"[API返回] ak.stock_cyq_em 返回空数据, 耗时 {api_elapsed:.2f}s")
-                return None
-            
-            logger.info(f"[API返回] ak.stock_cyq_em 成功: 返回 {len(df)} 天数据, 耗时 {api_elapsed:.2f}s")
-            logger.debug(f"[API返回] 筹码数据列名: {list(df.columns)}")
-            
-            # 取最新一天的数据
-            latest = df.iloc[-1]
-            
-            # 使用 realtime_types.py 中的统一转换函数
-            chip = ChipDistribution(
-                code=stock_code,
-                date=str(latest.get('日期', '')),
-                profit_ratio=safe_float(latest.get('获利比例')),
-                avg_cost=safe_float(latest.get('平均成本')),
-                cost_90_low=safe_float(latest.get('90成本-低')),
-                cost_90_high=safe_float(latest.get('90成本-高')),
-                concentration_90=safe_float(latest.get('90集中度')),
-                cost_70_low=safe_float(latest.get('70成本-低')),
-                cost_70_high=safe_float(latest.get('70成本-高')),
-                concentration_70=safe_float(latest.get('70集中度')),
-            )
-            
-            logger.info(f"[筹码分布] {stock_code} 日期={chip.date}: 获利比例={chip.profit_ratio:.1%}, "
-                       f"平均成本={chip.avg_cost}, 90%集中度={chip.concentration_90:.2%}, "
-                       f"70%集中度={chip.concentration_70:.2%}")
-            return chip
-            
-        except Exception as e:
-            logger.error(f"[API错误] 获取 {stock_code} 筹码分布失败: {e}")
-            return None
+
+        # 重试机制：GitHub Actions 访问东财接口延迟高，重试 3 次
+        max_attempts = 3
+        last_error = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self._set_random_user_agent()
+                # 首次不 sleep，后续重试前短等待
+                if attempt > 1:
+                    time.sleep(2 * attempt)
+
+                logger.info(f"[API调用] ak.stock_cyq_em(symbol={stock_code}) 获取筹码分布 (attempt {attempt}/{max_attempts})...")
+                import time as _time
+                api_start = _time.time()
+
+                df = ak.stock_cyq_em(symbol=stock_code)
+
+                api_elapsed = _time.time() - api_start
+
+                if df.empty:
+                    logger.warning(f"[API返回] ak.stock_cyq_em 返回空数据, 耗时 {api_elapsed:.2f}s")
+                    last_error = "empty response"
+                    continue
+
+                logger.info(f"[API返回] ak.stock_cyq_em 成功: 返回 {len(df)} 天数据, 耗时 {api_elapsed:.2f}s")
+                logger.debug(f"[API返回] 筹码数据列名: {list(df.columns)}")
+
+                # 取最新一天的数据
+                latest = df.iloc[-1]
+
+                # 使用 realtime_types.py 中的统一转换函数
+                chip = ChipDistribution(
+                    code=stock_code,
+                    date=str(latest.get('日期', '')),
+                    profit_ratio=safe_float(latest.get('获利比例')),
+                    avg_cost=safe_float(latest.get('平均成本')),
+                    cost_90_low=safe_float(latest.get('90成本-低')),
+                    cost_90_high=safe_float(latest.get('90成本-高')),
+                    concentration_90=safe_float(latest.get('90集中度')),
+                    cost_70_low=safe_float(latest.get('70成本-低')),
+                    cost_70_high=safe_float(latest.get('70成本-高')),
+                    concentration_70=safe_float(latest.get('70集中度')),
+                )
+
+                logger.info(f"[筹码分布] {stock_code} 日期={chip.date}: 获利比例={chip.profit_ratio:.1%}, "
+                           f"平均成本={chip.avg_cost}, 90%集中度={chip.concentration_90:.2%}, "
+                           f"70%集中度={chip.concentration_70:.2%}")
+                return chip
+
+            except Exception as e:
+                last_error = e
+                logger.warning(f"[API错误] 获取 {stock_code} 筹码分布失败 (attempt {attempt}/{max_attempts}): {e}")
+                if attempt < max_attempts:
+                    continue
+
+        logger.error(f"[API错误] 获取 {stock_code} 筹码分布最终失败，已重试 {max_attempts} 次: {last_error}")
+        return None
     
     def get_enhanced_data(self, stock_code: str, days: int = 60) -> Dict[str, Any]:
         """
@@ -1745,6 +1758,45 @@ class AkshareFetcher(BaseFetcher):
             
         return stats
 
+    # 东方财富板块名称 → 申万行业名称映射
+    EASTMONEY_TO_SHENWAN = {
+        "互联网服务": "计算机应用", "软件开发": "软件开发", "通信服务": "通信服务",
+        "半导体": "半导体", "电子元件": "电子元件", "计算机设备": "计算机设备",
+        "通信设备": "通信设备", "文化传媒": "传媒", "游戏": "游戏",
+        "消费电子": "消费电子", "光学光电子": "光学光电子",
+        "通用设备": "通用设备", "专用设备": "专用设备", "仪器仪表": "仪器仪表",
+        "汽车零部件": "汽车零部件", "汽车整车": "汽车整车",
+        "光伏设备": "光伏设备", "电池": "电池", "风电设备": "风电设备",
+        "电网设备": "电网设备", "电源设备": "电源设备",
+        "有色金属": "有色金属", "小金属": "小金属", "贵金属": "贵金属",
+        "钢铁行业": "钢铁", "煤炭行业": "煤炭", "石油行业": "石油石化",
+        "化学制品": "化学制品", "化学原料": "化学原料", "化学纤维": "化学纤维",
+        "橡胶制品": "橡胶", "塑料制品": "塑料",
+        "生物制品": "生物制品", "中药": "中药", "化学制药": "化学制药",
+        "医药商业": "医药商业", "医疗器械": "医疗器械", "医疗服务": "医疗服务",
+        "银行": "银行", "保险": "保险", "证券": "证券", "多元金融": "多元金融",
+        "房地产开发": "房地产开发", "房地产服务": "房地产服务",
+        "建筑材料": "建筑材料", "建筑装饰": "建筑装饰", "基础建设": "基础建设",
+        "工程咨询": "工程咨询", "电力行业": "电力", "燃气": "燃气",
+        "环保行业": "环保", "食品饮料": "食品饮料", "酿酒行业": "白酒",
+        "饮料制造": "饮料制造", "纺织服装": "纺织服装", "家用轻工": "家用轻工",
+        "家居用品": "家居用品", "造纸": "造纸", "包装材料": "包装印刷",
+        "农牧饲渔": "农林牧渔", "旅游酒店": "旅游及景区",
+        "航空机场": "航空机场", "铁路公路": "铁路公路", "航运港口": "航运港口",
+        "物流行业": "物流", "商业百货": "商业百货", "贸易行业": "贸易",
+        "装修装饰": "装修装饰", "综合行业": "综合", "教育": "教育",
+        "美容护理": "美容护理", "公用事业": "公用事业",
+        "军工装备": "军工", "航天航空": "航天航空",
+        "电子化学品": "电子化学品", "电机": "电机", "家电行业": "家用电器",
+        "汽车服务": "汽车服务", "能源金属": "能源金属",
+        "非金属材料": "非金属材料", "水泥建材": "水泥",
+        "工程机械": "工程机械", "农化制品": "农化制品",
+        "交运设备": "交运设备",
+    }
+
+    def _map_sector_name(self, name: str) -> str:
+        return self.EASTMONEY_TO_SHENWAN.get(name, name)
+
     def get_sector_rankings(self, n: int = 5) -> Optional[Tuple[List[Dict], List[Dict]]]:
         """
         获取行业板块涨跌榜
@@ -1762,13 +1814,13 @@ class AkshareFetcher(BaseFetcher):
             # 涨幅前n
             top = df.nlargest(n, change_col)
             top_sectors = [
-                {'name': row[industry_name], 'change_pct': row[change_col]}
+                {'name': self._map_sector_name(row[industry_name]), 'change_pct': row[change_col]}
                 for _, row in top.iterrows()
             ]
 
             bottom = df.nsmallest(n, change_col)
             bottom_sectors = [
-                {'name': row[industry_name], 'change_pct': row[change_col]}
+                {'name': self._map_sector_name(row[industry_name]), 'change_pct': row[change_col]}
                 for _, row in bottom.iterrows()
             ]
             return top_sectors, bottom_sectors
